@@ -125,3 +125,33 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+
+---
+
+## Cursor Cloud specific instructions
+
+This VM has **no GPU**, so vLLM is built and run as its **CPU backend**
+(`VLLM_TARGET_DEVICE=cpu`; see `docs/getting_started/installation/cpu.md`). The
+snapshot already contains a ready `.venv` with an editable, CPU-compiled vLLM.
+
+- **Use the prebuilt venv.** Run everything via `.venv/bin/python` /
+  `.venv/bin/vllm` (or `source .venv/bin/activate`). `uv` lives in `~/.local/bin`
+  (`astral.sh` is blocked, so it was installed from PyPI, not the install script).
+- **Egress is restricted; `huggingface.co` is blocked.** Models cannot be pulled
+  from the Hub. For runs and tests, point at a **local model directory** and set
+  `HF_HUB_OFFLINE=1`; use `--load-format dummy` to skip weight downloads (random
+  weights, so output is gibberish but the full engine path is exercised). Many
+  `-m cpu_test` tests still fetch model configs from the Hub and will fail —
+  prefer HF-independent tests (e.g. `tests/test_outputs.py`, `tests/test_inputs.py`).
+- **C/C++ rebuilds must force gcc.** `/usr/bin/c++` is clang and fails to link
+  libstdc++; always build with `CC=gcc CXX=g++`. Python-only edits need **no**
+  rebuild (editable install). C++/CMake/kernel edits require a manual rebuild —
+  the startup update script does not rebuild:
+  `CC=gcc CXX=g++ VLLM_TARGET_DEVICE=cpu uv pip install -e . --no-build-isolation --index-strategy unsafe-best-match`.
+  (`--index-strategy unsafe-best-match` is required whenever installing the
+  `requirements/*.txt` because they add the pytorch CPU extra index.)
+- **Running on CPU.** Set `VLLM_CPU_KVCACHE_SPACE` (GiB) and
+  `VLLM_CPU_OMP_THREADS_BIND` (e.g. `0-6`, reserve a core for the front-end), and
+  pass `--dtype bfloat16 --enforce-eager`. `vllm serve <local_dir> ... --port 8000`
+  exposes the OpenAI API; a from-scratch tokenizer has no chat template, so pass
+  `--chat-template` for `/v1/chat/completions`.
