@@ -38,6 +38,11 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
 )
+from vllm.model_executor.models.nemotron_parse_auxiliary import (
+    BoxTokenAuxiliaryHead,
+    iter_box_token_auxiliary_weights,
+    load_auxiliary_spec,
+)
 from vllm.model_executor.models.radio import RadioModel
 from vllm.model_executor.models.whisper import WhisperAttention, WhisperCrossAttention
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -545,6 +550,7 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        model_config = vllm_config.model_config
 
         self.config = config
         self.vision_config = config.encoder
@@ -571,6 +577,29 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.logits_processor = LogitsProcessor(
             self.vocab_size, config.decoder.vocab_size
         )
+        auxiliary_spec = load_auxiliary_spec(
+            model_config.model,
+            model_config.revision,
+            config.decoder.d_model,
+        )
+        self.box_token_auxiliary = None
+        self.box_token_auxiliary_token_groups = None
+        self._auxiliary_tensor_file = None
+        self._auxiliary_model = model_config.model
+        self._auxiliary_revision = model_config.revision
+        self._auxiliary_load_config = vllm_config.load_config
+        if auxiliary_spec is not None:
+            tensor_file, hidden_size, x_ids, y_ids, class_ids = auxiliary_spec
+            if hidden_size is not None:
+                self._auxiliary_tensor_file = tensor_file
+                self.box_token_auxiliary = BoxTokenAuxiliaryHead(
+                    config.decoder.d_model, hidden_size
+                )
+                self.box_token_auxiliary_token_groups = (
+                    x_ids,
+                    y_ids,
+                    class_ids,
+                )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -653,8 +682,20 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def box_token_auxiliary_predictions(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.box_token_auxiliary is None:
+            raise RuntimeError("box-token auxiliary head is not loaded")
+        return self.box_token_auxiliary(hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         lm_head_dict = dict(self.lm_head.named_parameters())
+        auxiliary_dict = (
+            dict(self.box_token_auxiliary.named_parameters())
+            if self.box_token_auxiliary is not None
+            else {}
+        )
 
         def is_encoder(name: str) -> bool:
             return name.startswith("encoder")
@@ -668,6 +709,7 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Separate weights by component
         encoder_weights = []
         decoder_weights = []
+        loaded_auxiliary_weights = set()
 
         for name, w in weights:
             if is_encoder(name):
@@ -682,7 +724,35 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
             else:
                 logger.info("Found unexpected weight: %s", name)
 
+        if auxiliary_dict:
+            load_config = self._auxiliary_load_config
+            assert self._auxiliary_tensor_file is not None
+            auxiliary_weights = iter_box_token_auxiliary_weights(
+                self._auxiliary_model,
+                self._auxiliary_revision,
+                self._auxiliary_tensor_file,
+                download_dir=load_config.download_dir,
+                ignore_patterns=load_config.ignore_patterns,
+                use_tqdm_on_load=load_config.use_tqdm_on_load,
+                safetensors_load_strategy=load_config.safetensors_load_strategy,
+            )
+            for name, w in auxiliary_weights:
+                trimmed_name = name.removeprefix("box_token_auxiliary.")
+                param = auxiliary_dict.get(trimmed_name)
+                if param is None:
+                    logger.info("Ignoring unused box-token auxiliary weight: %s", name)
+                    continue
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+                loaded_auxiliary_weights.add(trimmed_name)
+
         # Load encoder weights
         self.encoder.load_weights(encoder_weights)
         # Load decoder weights
         self.decoder.load_weights(decoder_weights)
+        if auxiliary_dict and loaded_auxiliary_weights != auxiliary_dict.keys():
+            missing = auxiliary_dict.keys() - loaded_auxiliary_weights
+            raise ValueError(
+                "Following box-token auxiliary weights were not loaded: "
+                f"{sorted(missing)}"
+            )
